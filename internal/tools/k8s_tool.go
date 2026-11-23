@@ -33,6 +33,20 @@ var (
 		},
 	}
 
+	K8sListContextsTool = &mcp.Tool{
+		Name:  "k8s_list_contexts",
+		Title: "List Kubernetes contexts",
+		Description: "List the Kubernetes contexts (clusters) this gateway may use (read-only): name, cluster, API server, user, " +
+			"kubeconfig default namespace and how it authenticates (never credentials). The default context is marked; " +
+			"pass a name as context to k8s_list_namespaces or k8s_list_images to target another cluster. " +
+			"Set check_connectivity to ask each API server for its version and see which clusters are reachable. " +
+			"Only contexts allowed by the gateway's K8S_ALLOWED_CONTEXTS are listed.",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:  true,
+			OpenWorldHint: boolPtr(true),
+		},
+	}
+
 	K8sListNameSpaceTool = &mcp.Tool{
 		Name:  "k8s_list_namespaces",
 		Title: "List Kubernetes namespaces",
@@ -68,36 +82,61 @@ func k8sNamespaceInputSchema() *jsonschema.Schema {
 	return s
 }
 
-// K8sToolsSuite holds the Kubernetes client. The client is created on the
-// first call, so the server still starts on machines without a cluster and
-// the agent gets a clear error instead.
+// K8sToolsSuite holds the Kubernetes clients, one per context. Config is
+// loaded on the first call, so the server still starts on machines without
+// a cluster and the agent gets a clear error instead.
 type K8sToolsSuite struct {
-	newClient func() (kubernetes.Interface, string, error)
+	load func() (*service.K8sSource, error)
 
-	once    sync.Once
-	client  kubernetes.Interface
-	ctxName string
-	err     error
+	once sync.Once
+	src  *service.K8sSource
+	err  error
 }
 
-// NewK8sToolsSuite uses in-cluster config or kubeconfig (see service.LoadKubernetesConfig).
+// NewK8sToolsSuite uses in-cluster config or kubeconfig (see service.LoadK8sSource).
 func NewK8sToolsSuite() *K8sToolsSuite {
-	return &K8sToolsSuite{newClient: service.LoadKubernetesConfig}
+	return &K8sToolsSuite{load: service.LoadK8sSource}
 }
 
-// NewK8sToolsSuiteWithClient uses a ready client (tests, custom setups).
+// NewK8sToolsSuiteWithClient serves one ready client as the default context (tests).
 func NewK8sToolsSuiteWithClient(c kubernetes.Interface) *K8sToolsSuite {
-	return &K8sToolsSuite{newClient: func() (kubernetes.Interface, string, error) { return c, "", nil }}
+	return NewK8sToolsSuiteWithSource(service.NewStaticK8sSource("default", map[string]kubernetes.Interface{"default": c}))
 }
 
-func (ks *K8sToolsSuite) clientset() (kubernetes.Interface, string, error) {
-	ks.once.Do(func() { ks.client, ks.ctxName, ks.err = ks.newClient() })
-	return ks.client, ks.ctxName, ks.err
+// NewK8sToolsSuiteWithSource uses a prepared source (tests, custom setups).
+func NewK8sToolsSuiteWithSource(src *service.K8sSource) *K8sToolsSuite {
+	return &K8sToolsSuite{load: func() (*service.K8sSource, error) { return src, nil }}
+}
+
+func (ks *K8sToolsSuite) source() (*service.K8sSource, error) {
+	ks.once.Do(func() { ks.src, ks.err = ks.load() })
+	return ks.src, ks.err
+}
+
+func (ks *K8sToolsSuite) clientset(name string) (kubernetes.Interface, string, error) {
+	src, err := ks.source()
+	if err != nil {
+		return nil, "", err
+	}
+	return src.Client(name)
+}
+
+// RunListK8sContexts is the MCP handler for k8s_list_contexts.
+func (ks *K8sToolsSuite) RunListK8sContexts(_ context.Context, _ *mcp.CallToolRequest, in types.K8sContextListInput) (*mcp.CallToolResult, *types.K8sContextListResult, error) {
+	src, err := ks.source()
+	if err != nil {
+		return nil, nil, fmt.Errorf("k8s_list_contexts: %w", err)
+	}
+	res, err := service.ListK8sContexts(src, in)
+	if err != nil {
+		return nil, nil, fmt.Errorf("k8s_list_contexts: %w", err)
+	}
+	return nil, res, nil
 }
 
 // RunListK8sNameSpace is the MCP handler for k8s_list_namespaces.
 func (ks *K8sToolsSuite) RunListK8sNameSpace(ctx context.Context, _ *mcp.CallToolRequest, in types.K8sNameSpaceListInput) (*mcp.CallToolResult, *types.K8sNameSpaceListResult, error) {
-	cs, ctxName, err := ks.clientset()
+	cs, ctxName, err := ks.clientset(in.Context)
 	if err != nil {
 		return nil, nil, fmt.Errorf("k8s_list_namespaces: %w", err)
 	}
@@ -114,7 +153,7 @@ func (ks *K8sToolsSuite) RunListK8sNameSpace(ctx context.Context, _ *mcp.CallToo
 
 // RunListK8sImages is the MCP handler for k8s_list_images.
 func (ks *K8sToolsSuite) RunListK8sImages(ctx context.Context, _ *mcp.CallToolRequest, in types.K8sImageListInput) (*mcp.CallToolResult, *types.K8sImageListResult, error) {
-	cs, ctxName, err := ks.clientset()
+	cs, ctxName, err := ks.clientset(in.Context)
 	if err != nil {
 		return nil, nil, fmt.Errorf("k8s_list_images: %w", err)
 	}

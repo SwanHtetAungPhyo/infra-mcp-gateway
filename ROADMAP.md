@@ -43,7 +43,7 @@ Everything else depends on these. Without them each new provider re-invents auth
 Read-only RBAC: `get/list/watch` on the resources below, never `secrets` data.
 
 ### Inventory
-- [ ] **P1** `k8s_contexts_list` — kubeconfig contexts the server may use (respecting `K8S_ALLOWED_CONTEXTS`); add `context` input to every k8s tool
+- [x] **P1** `k8s_list_contexts` — kubeconfig contexts the server may use (respecting `K8S_ALLOWED_CONTEXTS`); `context` input on every k8s tool
 - [x] **P1** `k8s_list_namespaces` — with labels, phase, age, pod health counts
 - [ ] **P1** `k8s_nodes_list` — version, OS/arch, capacity vs allocatable, conditions, taints
 - [ ] **P1** `k8s_workloads_list` — Deployments, StatefulSets, DaemonSets, Jobs, CronJobs with desired/ready replicas and images

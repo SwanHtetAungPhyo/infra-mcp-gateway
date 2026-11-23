@@ -2,10 +2,8 @@ package service
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"maps"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -16,8 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
 var (
@@ -32,35 +28,6 @@ const (
 	k8sMaxPods      = 20000 // stop paging after this many pods
 	k8sMaxWorkloads = 20    // workloads listed per image
 )
-
-// LoadKubernetesConfig builds a client: in-cluster service account first,
-// otherwise the usual kubeconfig rules ($KUBECONFIG, then ~/.kube/config).
-// K8S_CONTEXT picks a kubeconfig context other than the current one.
-// It returns the context name in use ("" in-cluster).
-func LoadKubernetesConfig() (kubernetes.Interface, string, error) {
-	cfg, err := rest.InClusterConfig()
-	ctxName := ""
-	if errors.Is(err, rest.ErrNotInCluster) {
-		rules := clientcmd.NewDefaultClientConfigLoadingRules()
-		overrides := &clientcmd.ConfigOverrides{CurrentContext: os.Getenv("K8S_CONTEXT")}
-		cc := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides)
-		if raw, rerr := cc.RawConfig(); rerr == nil {
-			ctxName = raw.CurrentContext
-			if overrides.CurrentContext != "" {
-				ctxName = overrides.CurrentContext
-			}
-		}
-		cfg, err = cc.ClientConfig()
-	}
-	if err != nil {
-		return nil, "", fmt.Errorf("load kubernetes config: %w", err)
-	}
-
-	cfg.QPS, cfg.Burst = 20, 40
-	cfg.Timeout = 30 * time.Second
-	cs, err := kubernetes.NewForConfig(cfg)
-	return cs, ctxName, err
-}
 
 // normalizeK8sInput validates and fills defaults. Selectors are parsed
 // locally so the agent gets a clear error instead of an API 400.

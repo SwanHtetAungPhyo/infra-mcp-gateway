@@ -84,7 +84,7 @@ func listTools(t *testing.T) []string {
 // Regression: ENABLED_TOOL typo + " " comparison registered zero tools.
 func TestNewMCPServerRegistersTools(t *testing.T) {
 	t.Setenv("ENABLED_TOOLS", "")
-	if got := listTools(t); !slices.Equal(got, []string{"k8s_list_images", "k8s_list_namespaces", "nmap_scan", "trivy_scan"}) {
+	if got := listTools(t); !slices.Equal(got, []string{"k8s_list_contexts", "k8s_list_images", "k8s_list_namespaces", "nmap_scan", "trivy_scan"}) {
 		t.Fatalf("unset ENABLED_TOOLS: got %v", got)
 	}
 	t.Setenv("ENABLED_TOOLS", " trivy_scan, ")

@@ -4,6 +4,7 @@ package types
 // Every field is optional: an empty call lists every image in every namespace.
 type (
 	K8sImageListInput struct {
+		Context       string `json:"context,omitempty" jsonschema:"kubeconfig context to use, from k8s_list_contexts; default is the gateway's default context"`
 		Namespace     string `json:"namespace,omitempty" jsonschema:"only look at pods in this namespace; empty means all namespaces"`
 		LabelSelector string `json:"label_selector,omitempty" jsonschema:"Kubernetes label selector, e.g. app=nginx,tier!=cache or environment in (prod,staging)"`
 		FieldSelector string `json:"field_selector,omitempty" jsonschema:"Kubernetes pod field selector, e.g. status.phase=Running or spec.nodeName=node-1"`
@@ -16,6 +17,7 @@ type (
 	// K8sNameSpaceListInput is the argument schema for k8s_list_namespaces.
 	// Every field is optional: an empty call lists every namespace with pod counts.
 	K8sNameSpaceListInput struct {
+		Context       string `json:"context,omitempty" jsonschema:"kubeconfig context to use, from k8s_list_contexts; default is the gateway's default context"`
 		LabelSelector string `json:"label_selector,omitempty" jsonschema:"Kubernetes label selector on namespaces, e.g. team=payments or environment in (prod,staging)"`
 		NameContains  string `json:"name_contains,omitempty" jsonschema:"only namespaces whose name contains this text, e.g. prod"`
 		Phase         string `json:"phase,omitempty" jsonschema:"only namespaces in this phase: Active or Terminating; default both"`
@@ -101,5 +103,35 @@ type (
 		ImageID  string `json:"image_id,omitempty"`
 		Ready    bool   `json:"ready"`
 		Restarts int32  `json:"restarts,omitempty"`
+	}
+
+	// K8sContextListInput is the argument schema for k8s_list_contexts.
+	K8sContextListInput struct {
+		NameContains      string `json:"name_contains,omitempty" jsonschema:"only contexts whose name contains this text, e.g. prod"`
+		CheckConnectivity bool   `json:"check_connectivity,omitempty" jsonschema:"ask each context's API server for its version (5s timeout each) to see which clusters are reachable"`
+	}
+
+	// K8sContextListResult lists the contexts the agent may pass as context.
+	K8sContextListResult struct {
+		Source   string       `json:"source"`            // kubeconfig | in-cluster | static
+		Default  string       `json:"default,omitempty"` // used when a call passes no context
+		Summary  string       `json:"summary"`
+		Hidden   int          `json:"hidden,omitempty"` // contexts not allowed by K8S_ALLOWED_CONTEXTS
+		Contexts []K8sContext `json:"contexts"`
+	}
+
+	// K8sContext describes one context. Credentials are never included,
+	// only the kind of authentication.
+	K8sContext struct {
+		Name      string `json:"name"`
+		Default   bool   `json:"default,omitempty"`
+		Cluster   string `json:"cluster,omitempty"`
+		Server    string `json:"server,omitempty"`
+		User      string `json:"user,omitempty"`
+		Namespace string `json:"namespace,omitempty"` // kubeconfig default; the k8s tools don't use it
+		Auth      string `json:"auth"`                // exec:<cmd> | token | client-certificate | auth-provider:<name> | basic | service-account | none
+		Reachable *bool  `json:"reachable,omitempty"` // set by check_connectivity
+		Version   string `json:"version,omitempty"`
+		Error     string `json:"error,omitempty"`
 	}
 )

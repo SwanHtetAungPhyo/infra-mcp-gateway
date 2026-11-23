@@ -52,12 +52,38 @@ Vulnerabilities, leaked secrets and IaC misconfigurations.
 - Findings come back sorted by severity, with fix versions and remediation.
 - **Secret values are never returned**, only the rule, file and line.
 
+### `k8s_list_contexts`
+
+The Kubernetes contexts (clusters) the agent may target. Every k8s tool takes an optional `context` argument; without it the gateway's default context is used.
+
+```json
+{ "check_connectivity": true }
+```
+
+```json
+{ "source": "kubeconfig", "default": "kind-dev",
+  "summary": "2 contexts available from kubeconfig, default kind-dev; 1 of 2 reachable; 3 more not allowed by K8S_ALLOWED_CONTEXTS",
+  "hidden": 3,
+  "contexts": [
+    { "name": "kind-dev", "default": true, "cluster": "kind-dev", "server": "https://127.0.0.1:6443",
+      "user": "kind-dev", "auth": "client-certificate", "reachable": true, "version": "v1.33.1" },
+    { "name": "prod", "cluster": "prod", "server": "https://prod.example.com", "user": "prod-ro",
+      "namespace": "payments", "auth": "exec:aws", "reachable": false, "error": "…connection refused" }] }
+```
+
+- `auth` says how the context logs in (`exec:aws`, `token`, `client-certificate`, `auth-provider:<name>`, `service-account`…). Tokens, keys, certificates and exec arguments are never returned.
+- `check_connectivity` asks each API server for its version, 4 at a time with a 5 s timeout each.
+- `name_contains` narrows the list, e.g. `prod`.
+- Contexts outside `K8S_ALLOWED_CONTEXTS` are only counted in `hidden`. Calling a tool with one gets the same error as an unknown name, so names don't leak.
+- `namespace` is the kubeconfig default for kubectl; the k8s tools ignore it and treat an empty `namespace` argument as all namespaces.
+
 ### `k8s_list_images`
 
 Container images used by pods in the cluster, read from the Kubernetes API (no binaries needed). With no arguments it lists every unique image across all namespaces, the most widely used first.
 
 | Argument | Effect |
 |---|---|
+| `context` | Context from `k8s_list_contexts`; default is the gateway's default |
 | `namespace` | One namespace; empty means all |
 | `label_selector` | e.g. `app=api,tier!=cache` |
 | `field_selector` | e.g. `status.phase=Running`, `spec.nodeName=node-1` |
@@ -89,6 +115,7 @@ Namespaces with their phase, age, labels and pod health. With no arguments it li
 
 | Argument | Effect |
 |---|---|
+| `context` | Context from `k8s_list_contexts`; default is the gateway's default |
 | `label_selector` | Selector on namespace labels, e.g. `team=payments` |
 | `name_contains` | Only namespaces whose name contains this text, e.g. `prod` |
 | `phase` | `Active` or `Terminating`; default both |
@@ -113,7 +140,7 @@ Namespaces with their phase, age, labels and pod health. With no arguments it li
 - Pod counts come from one paged, cluster-wide pod list (500 per page, up to 20,000), not one call per namespace.
 - A natural next step is `k8s_list_images` with `namespace` set to a namespace it returns.
 
-Both k8s tools share one client. It is created on the first call: the in-cluster service account first, then `$KUBECONFIG`, then `~/.kube/config`, with `K8S_CONTEXT` picking a non-current context. The server starts without a cluster; calls just return an error.
+Config is loaded on the first k8s call: the in-cluster service account first (one context, `in-cluster`), then `$KUBECONFIG`, then `~/.kube/config`. The default context is `K8S_CONTEXT`, else kubeconfig's `current-context`. Only contexts in `K8S_ALLOWED_CONTEXTS` can be used; when it's unset, that's just the default context. Each context gets its own client, created when first used and then reused. Kubeconfig is read once, so restart the gateway after editing it. The server starts without a cluster; calls just return an error.
 
 ## Safety model
 
@@ -122,7 +149,7 @@ The rules live in code, not in a prompt. A confused agent or a prompt injection 
 | Question | Enforced by |
 |---|---|
 | Who may call? | `Authorization: Bearer` checked against `MCP_AUTH_TOKEN` (constant-time). The server won't start in http mode without a 32+ character token |
-| What may be scanned? | `NMAP_ALLOWED_CIDRS` (fails closed when unset, at most `/24` per target, hostnames resolved once and the checked IPs passed to nmap), `TRIVY_ALLOWED_ROOTS` (symlinks resolved, never `/`), `https://` repos without credentials, the Kubernetes RBAC granted to the gateway's identity, `ENABLED_TOOLS` |
+| What may be scanned? | `NMAP_ALLOWED_CIDRS` (fails closed when unset, at most `/24` per target, hostnames resolved once and the checked IPs passed to nmap), `TRIVY_ALLOWED_ROOTS` (symlinks resolved, never `/`), `K8S_ALLOWED_CONTEXTS` (only the default context when unset), `https://` repos without credentials, the Kubernetes RBAC granted to the gateway's identity, `ENABLED_TOOLS` |
 | What may a request contain? | JSON schemas checked by the SDK, then strict validators. The binary and its flags are fixed; targets and refs come after `--` and can't start with `-` |
 | How much may it use? | Per-tool timeouts (nmap 5 min, trivy 10 min, k8s 2 min), `MAX_CONCURRENT_SCANS`, a 64 MiB output cap; a timeout kills the scanner's whole process group. The k8s tools page 500 items at a time, stop at 20,000 pods and are rate-limited to 20 QPS |
 | What comes back? | Compact typed results; secret matches stripped; only pod images, pod status and namespace metadata from Kubernetes, never env vars or Secrets |
@@ -155,7 +182,8 @@ Copy `.env.example` to `.env` for local runs. In Kubernetes, set these from Conf
 | `TRIVY_SERVER` | http | Optional Trivy server that `/readyz` checks |
 | `GITHUB_TOKEN` / `GITLAB_TOKEN` | http, stdio | Read-only token Trivy uses to clone private repos. The agent never sees it |
 | `KUBECONFIG` | http, stdio | Kubeconfig for the k8s tools outside a cluster. Default `~/.kube/config`; ignored in-cluster |
-| `K8S_CONTEXT` | http, stdio | Optional kubeconfig context to use instead of the current one |
+| `K8S_CONTEXT` | http, stdio | Default kubeconfig context instead of `current-context` |
+| `K8S_ALLOWED_CONTEXTS` | http, stdio | Comma-separated contexts the agent may pass as `context`, or `*` for all. Unset means only the default context |
 | `TOOL_NAME`, `HUB_URL`, `RESULT_URL`, `CLAIM_TOKEN`, `RUN_INTERVAL` | runner | Hub endpoints and schedule (default `1h`) |
 
 ## Run locally
@@ -269,7 +297,8 @@ internal/service/           validation, scope checks, scanner invocation, result
   command.go                RunCommand: slots, output cap, process-group kill
   nmap.go                   ScanNmap, resolveTargets (CIDR scope), SummarizeNmap
   trivy.go                  ScanTrivy, allowed roots, refs, default scanners
-  k8s.go                    LoadKubernetesConfig, ListK8sImages, ListK8sNameSpace, ParseImageRef
+  k8s.go                    ListK8sImages, ListK8sNameSpace, ParseImageRef
+  k8s_contexts.go           K8sSource: kubeconfig/in-cluster contexts, allowlist, per-context clients
 internal/types/             input and output structs shared by every layer
 ```
 

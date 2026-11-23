@@ -36,6 +36,12 @@ var registry = []entry{
 	// k8s tools talk to the API server directly (no binaries) and share one
 	// lazily created client.
 	{
+		name: K8sListContextsTool.Name,
+		add: func(server *mcp.Server) {
+			mcp.AddTool(server, K8sListContextsTool, k8sSuite.RunListK8sContexts)
+		},
+	},
+	{
 		name: K8sListImagesTool.Name,
 		add: func(server *mcp.Server) {
 			mcp.AddTool(server, K8sListImagesTool, k8sSuite.RunListK8sImages)

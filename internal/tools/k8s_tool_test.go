@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"ai.engineer.runner/internal/service"
 	"ai.engineer.runner/internal/types"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	corev1 "k8s.io/api/core/v1"
@@ -146,8 +147,8 @@ func TestK8sListImagesRejectsBadInput(t *testing.T) {
 }
 
 func TestK8sNoClusterIsToolError(t *testing.T) {
-	suite := &K8sToolsSuite{newClient: func() (kubernetes.Interface, string, error) {
-		return nil, "", errors.New("no kubeconfig")
+	suite := &K8sToolsSuite{load: func() (*service.K8sSource, error) {
+		return nil, errors.New("no kubeconfig")
 	}}
 	cs := connectK8s(t, suite)
 	if res, _ := callK8s(t, cs, map[string]any{}); !res.IsError {
@@ -274,5 +275,63 @@ func TestK8sListNamespacesFilters(t *testing.T) {
 		if res, _ := callNS(t, cs, args); !res.IsError {
 			t.Errorf("%v: expected tool error", args)
 		}
+	}
+}
+
+func TestK8sContextsListAndRouting(t *testing.T) {
+	prod := fake.NewClientset(ns("payments", corev1.NamespaceActive, nil))
+	dev := fake.NewClientset(ns("sandbox", corev1.NamespaceActive, nil), ns("tools", corev1.NamespaceActive, nil))
+	suite := NewK8sToolsSuiteWithSource(service.NewStaticK8sSource("prod", map[string]kubernetes.Interface{"prod": prod, "dev": dev}))
+
+	ctx := context.Background()
+	srv := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0"}, nil)
+	mcp.AddTool(srv, K8sListContextsTool, suite.RunListK8sContexts)
+	mcp.AddTool(srv, K8sListNameSpaceTool, suite.RunListK8sNameSpace)
+	ct, st := mcp.NewInMemoryTransports()
+	if _, err := srv.Connect(ctx, st, nil); err != nil {
+		t.Fatal(err)
+	}
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "c", Version: "0"}, nil).Connect(ctx, ct, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "k8s_list_contexts", Arguments: map[string]any{"check_connectivity": true}})
+	if err != nil || res.IsError {
+		t.Fatalf("k8s_list_contexts: %v %+v", err, res)
+	}
+	var list types.K8sContextListResult
+	b, _ := json.Marshal(res.StructuredContent)
+	if err := json.Unmarshal(b, &list); err != nil {
+		t.Fatal(err)
+	}
+	if list.Default != "prod" || len(list.Contexts) != 2 || list.Contexts[0].Name != "dev" || !list.Contexts[1].Default {
+		t.Fatalf("contexts = %+v", list)
+	}
+	for _, c := range list.Contexts {
+		if c.Reachable == nil || !*c.Reachable {
+			t.Errorf("%s not reachable: %+v", c.Name, c)
+		}
+	}
+
+	for _, tc := range []struct {
+		context string
+		want    string
+	}{{"", "payments"}, {"prod", "payments"}, {"dev", "sandbox,tools"}} {
+		_, out := callNS(t, cs, map[string]any{"context": tc.context, "skip_pod_counts": true})
+		var got []string
+		for _, n := range out.Namespaces {
+			got = append(got, n.Name)
+		}
+		if strings.Join(got, ",") != tc.want {
+			t.Errorf("context %q: got %v want %s", tc.context, got, tc.want)
+		}
+		if want := tc.context; want == "" && out.Context != "prod" || want != "" && out.Context != want {
+			t.Errorf("context %q: result context = %q", tc.context, out.Context)
+		}
+	}
+	if res, _ := callNS(t, cs, map[string]any{"context": "staging"}); !res.IsError {
+		t.Error("unknown context should be a tool error")
 	}
 }
