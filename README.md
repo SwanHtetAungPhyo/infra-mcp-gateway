@@ -2,13 +2,14 @@
 
 [![CI](https://github.com/SwanHtetAungPhyo/infra-mcp-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/SwanHtetAungPhyo/infra-mcp-gateway/actions/workflows/ci.yml)
 
-An [MCP](https://modelcontextprotocol.io) gateway that gives an AI agent safe, validated access to infrastructure security scanners.
+An [MCP](https://modelcontextprotocol.io) gateway that gives an AI agent safe, validated access to infrastructure security scanners and a read-only view of a Kubernetes cluster.
 
-The agent decides **what** to look at. The gateway decides **what is allowed**, runs the scan and returns compact, typed findings the model can reason about. The agent itself never gets scanner binaries, network reach or credentials. It only gets this server's URL and a token.
+The agent decides **what** to look at. The gateway decides **what is allowed**, runs the scan and returns compact, typed findings the model can reason about. The agent itself never gets scanner binaries, network reach, cluster credentials or other secrets. It only gets this server's URL and a token.
 
 ```
  infra agent ──tools/call + Bearer──▶ infra-mcp-gateway ──▶ nmap · nmap-formatter · trivy ──▶ allowed targets
  (Claude)                               auth · scope · limits                               hosts · images · git repos
+                                                         └──▶ Kubernetes API (list pods) ──▶ running images
 
  runner (cron) ──claim / push──▶ your hub        same binary, no MCP: a scheduled baseline scan
 ```
@@ -51,6 +52,39 @@ Vulnerabilities, leaked secrets and IaC misconfigurations.
 - Findings come back sorted by severity, with fix versions and remediation.
 - **Secret values are never returned**, only the rule, file and line.
 
+### `k8s_list_images`
+
+Container images used by pods in the cluster, read from the Kubernetes API (no binaries needed). With no arguments it lists every unique image across all namespaces, the most widely used first.
+
+| Argument | Effect |
+|---|---|
+| `namespace` | One namespace; empty means all |
+| `label_selector` | e.g. `app=api,tier!=cache` |
+| `field_selector` | e.g. `status.phase=Running`, `spec.nodeName=node-1` |
+| `image_contains` | Only images whose reference contains this text, e.g. `ghcr.io/acme` |
+| `container_kind` | `container`, `init` or `ephemeral`; default all |
+| `group_by` | `image` (default): one row per unique image. `pod`: each pod with its containers, readiness and restarts |
+| `max_results` | 1–1000, default 200 |
+
+```json
+{ "namespace": "prod", "field_selector": "status.phase=Running" }
+```
+
+```json
+{ "summary": "2 unique images across 3 pods in namespace prod; 1 use :latest or no tag",
+  "pods_scanned": 3, "total_images": 2,
+  "images": [{ "image": "ghcr.io/acme/api:1.2.0", "registry": "ghcr.io", "repository": "acme/api", "tag": "1.2.0",
+               "running_digests": ["sha256:…"], "pods": 2, "containers": 2, "kinds": ["container"],
+               "namespaces": ["prod"], "workloads": ["prod/Deployment/api"] }] }
+```
+
+- `running_digests` are the digests the kubelet actually pulled, so a moving tag shows up as several digests.
+- Workloads are named `namespace/Kind/name`. Pods from a ReplicaSet are reported as their Deployment.
+- Selectors, namespace and enums are checked before the API is called, so bad input comes back as a clear tool error.
+- A natural next step is `trivy_scan` with `scan_type: image` on each image it returns.
+
+The client is created on the first call: the in-cluster service account first, then `$KUBECONFIG`, then `~/.kube/config`, with `K8S_CONTEXT` picking a non-current context. The server starts without a cluster; calls just return an error.
+
 ## Safety model
 
 The rules live in code, not in a prompt. A confused agent or a prompt injection can't widen them.
@@ -58,12 +92,12 @@ The rules live in code, not in a prompt. A confused agent or a prompt injection 
 | Question | Enforced by |
 |---|---|
 | Who may call? | `Authorization: Bearer` checked against `MCP_AUTH_TOKEN` (constant-time). The server won't start in http mode without a 32+ character token |
-| What may be scanned? | `NMAP_ALLOWED_CIDRS` (fails closed when unset, at most `/24` per target, hostnames resolved once and the checked IPs passed to nmap), `TRIVY_ALLOWED_ROOTS` (symlinks resolved, never `/`), `https://` repos without credentials, `ENABLED_TOOLS` |
+| What may be scanned? | `NMAP_ALLOWED_CIDRS` (fails closed when unset, at most `/24` per target, hostnames resolved once and the checked IPs passed to nmap), `TRIVY_ALLOWED_ROOTS` (symlinks resolved, never `/`), `https://` repos without credentials, the Kubernetes RBAC granted to the gateway's identity, `ENABLED_TOOLS` |
 | What may a request contain? | JSON schemas checked by the SDK, then strict validators. The binary and its flags are fixed; targets and refs come after `--` and can't start with `-` |
-| How much may it use? | Per-tool timeouts (5 / 10 min), `MAX_CONCURRENT_SCANS`, a 64 MiB output cap; a timeout kills the scanner's whole process group |
-| What comes back? | Compact typed results; secret matches stripped |
+| How much may it use? | Per-tool timeouts (nmap 5 min, trivy 10 min, k8s 2 min), `MAX_CONCURRENT_SCANS`, a 64 MiB output cap; a timeout kills the scanner's whole process group. `k8s_list_images` pages 500 pods at a time, stops at 20,000 and is rate-limited to 20 QPS |
+| What comes back? | Compact typed results; secret matches stripped; only pod images and metadata from Kubernetes, never env vars or Secrets |
 
-Both tools are read-only. Anything that changes infrastructure would be a separate tool, marked destructive and gated behind human approval.
+All tools are read-only. Anything that changes infrastructure would be a separate tool, marked destructive and gated behind human approval.
 
 ## Modes
 
@@ -90,6 +124,8 @@ Copy `.env.example` to `.env` for local runs. In Kubernetes, set these from Conf
 | `MAX_CONCURRENT_SCANS` | all | Scans running at once. Default `2` |
 | `TRIVY_SERVER` | http | Optional Trivy server that `/readyz` checks |
 | `GITHUB_TOKEN` / `GITLAB_TOKEN` | http, stdio | Read-only token Trivy uses to clone private repos. The agent never sees it |
+| `KUBECONFIG` | http, stdio | Kubeconfig for `k8s_list_images` outside a cluster. Default `~/.kube/config`; ignored in-cluster |
+| `K8S_CONTEXT` | http, stdio | Optional kubeconfig context to use instead of the current one |
 | `TOOL_NAME`, `HUB_URL`, `RESULT_URL`, `CLAIM_TOKEN`, `RUN_INTERVAL` | runner | Hub endpoints and schedule (default `1h`) |
 
 ## Run locally
@@ -138,7 +174,7 @@ NMAP_ALLOWED_CIDRS=127.0.0.1/32 npx @modelcontextprotocol/inspector ./bin/runner
 }
 ```
 
-Claude Desktop doesn't load your shell's `PATH`, so set it explicitly or the scanners won't be found.
+Claude Desktop doesn't load your shell's `PATH`, so set it explicitly or the scanners won't be found. For `k8s_list_images`, also set `KUBECONFIG` if your kubeconfig isn't at `~/.kube/config`, and make sure any exec credential plugin it uses (`aws`, `gcloud`, `kubelogin`) is on that `PATH`.
 
 ## Deploying to Kubernetes
 
@@ -148,7 +184,25 @@ The target layout, namespace `infra-agent`:
 - **Agent:** a separate workload (Claude Agent SDK) that calls `http://<service>.infra-agent.svc:8080/mcp` with the token from a Secret.
 - **Runner:** a CronJob running `-mode=runner`.
 - **Pod security:** `runAsNonRoot`, `readOnlyRootFilesystem` with an `emptyDir` at `/tmp`, `capabilities: drop: [ALL]` (nmap connect scans need no raw sockets), seccomp `RuntimeDefault`.
-- **NetworkPolicy:** ingress only from the agent; egress only to `NMAP_ALLOWED_CIDRS`, your registries and your git host. This is the same scope the code enforces, applied a second time at the network level.
+- **RBAC for `k8s_list_images`:** a dedicated ServiceAccount bound to a ClusterRole with only `get`/`list` on `pods` (see below). Use a namespaced Role instead if the agent should only see some namespaces, and have it always pass `namespace`.
+- **NetworkPolicy:** ingress only from the agent; egress only to `NMAP_ALLOWED_CIDRS`, the Kubernetes API server, your registries and your git host. This is the same scope the code enforces, applied a second time at the network level.
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: infra-mcp-gateway-images }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: infra-mcp-gateway-images }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: infra-mcp-gateway-images }
+subjects:
+  - { kind: ServiceAccount, name: infra-mcp-gateway, namespace: infra-agent }
+```
 
 Probes:
 
@@ -167,7 +221,7 @@ go test ./...                                     # unit and local integration t
 TRIVY_NETWORK_TESTS=1 go test ./internal/service  # also clones a small public repo
 ```
 
-Tests that need `nmap` or `trivy` skip themselves when the binary isn't installed.
+Tests that need `nmap` or `trivy` skip themselves when the binary isn't installed. The `k8s_list_images` tests use client-go's fake clientset, so they need no cluster.
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request:
 
@@ -185,11 +239,12 @@ internal/service/           validation, scope checks, scanner invocation, result
   command.go                RunCommand: slots, output cap, process-group kill
   nmap.go                   ScanNmap, resolveTargets (CIDR scope), SummarizeNmap
   trivy.go                  ScanTrivy, allowed roots, refs, default scanners
+  k8s.go                    LoadKubernetesConfig, ListK8sImages, ParseImageRef
 internal/types/             input and output structs shared by every layer
 ```
 
 ### Adding a tool
 
 1. Create `internal/tools/<name>.go` with an `mcp.Tool` and a typed handler.
-2. Put validation and execution in `internal/service/<name>.go`, running binaries through `RunCommand`.
+2. Put validation and execution in `internal/service/<name>.go`, running binaries through `RunCommand` (or calling an API client, as `k8s.go` does).
 3. Add one entry to `registry` in `internal/tools/registry.go`, listing the binaries it needs so `/readyz` checks them.
