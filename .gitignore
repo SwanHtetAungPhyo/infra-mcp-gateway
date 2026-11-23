@@ -1,0 +1,23 @@
+# Build output
+/bin/
+
+# Local config and secrets
+.env
+.env.*
+!.env.example
+
+# Scan output (nmap/trivy reports describe real hosts)
+/nmap/
+/J
+/output.*
+*.xml.tmp
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Go test artifacts
+*.test
+*.out
+coverage.*
