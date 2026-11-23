@@ -9,7 +9,7 @@ The agent decides **what** to look at. The gateway decides **what is allowed**, 
 ```
  infra agent ──tools/call + Bearer──▶ infra-mcp-gateway ──▶ nmap · nmap-formatter · trivy ──▶ allowed targets
  (Claude)                               auth · scope · limits                               hosts · images · git repos
-                                                         └──▶ Kubernetes API (list pods) ──▶ running images
+                                                         └──▶ Kubernetes API (list pods, namespaces) ──▶ images · namespace health
 
  runner (cron) ──claim / push──▶ your hub        same binary, no MCP: a scheduled baseline scan
 ```
@@ -83,7 +83,37 @@ Container images used by pods in the cluster, read from the Kubernetes API (no b
 - Selectors, namespace and enums are checked before the API is called, so bad input comes back as a clear tool error.
 - A natural next step is `trivy_scan` with `scan_type: image` on each image it returns.
 
-The client is created on the first call: the in-cluster service account first, then `$KUBECONFIG`, then `~/.kube/config`, with `K8S_CONTEXT` picking a non-current context. The server starts without a cluster; calls just return an error.
+### `k8s_list_namespaces`
+
+Namespaces with their phase, age, labels and pod health. With no arguments it lists every namespace, sorted by name.
+
+| Argument | Effect |
+|---|---|
+| `label_selector` | Selector on namespace labels, e.g. `team=payments` |
+| `name_contains` | Only namespaces whose name contains this text, e.g. `prod` |
+| `phase` | `Active` or `Terminating`; default both |
+| `exclude_system` | Hide `kube-system`, `kube-public`, `kube-node-lease` and `default` |
+| `skip_pod_counts` | Don't list pods: faster on very large clusters, but `pods` is left out |
+| `max_results` | 1–1000, default 200 |
+
+```json
+{ "exclude_system": true }
+```
+
+```json
+{ "summary": "3 namespaces, 12 pods; failing, crash-looping or not-ready pods in: prod",
+  "total": 3, "pods_scanned": 12,
+  "namespaces": [{ "name": "prod", "phase": "Active", "age": "41d", "created_at": "2026-10-13T09:12:00Z",
+                   "labels": { "team": "payments" },
+                   "pods": { "total": 8, "running": 7, "pending": 1, "not_ready": 1, "crash_looping": 1 } }] }
+```
+
+- The summary names every namespace with failed, crash-looping or not-ready pods, so the agent knows where to look next.
+- `kubernetes.io/metadata.name` is left out of `labels`, since it always equals the name.
+- Pod counts come from one paged, cluster-wide pod list (500 per page, up to 20,000), not one call per namespace.
+- A natural next step is `k8s_list_images` with `namespace` set to a namespace it returns.
+
+Both k8s tools share one client. It is created on the first call: the in-cluster service account first, then `$KUBECONFIG`, then `~/.kube/config`, with `K8S_CONTEXT` picking a non-current context. The server starts without a cluster; calls just return an error.
 
 ## Safety model
 
@@ -94,8 +124,8 @@ The rules live in code, not in a prompt. A confused agent or a prompt injection 
 | Who may call? | `Authorization: Bearer` checked against `MCP_AUTH_TOKEN` (constant-time). The server won't start in http mode without a 32+ character token |
 | What may be scanned? | `NMAP_ALLOWED_CIDRS` (fails closed when unset, at most `/24` per target, hostnames resolved once and the checked IPs passed to nmap), `TRIVY_ALLOWED_ROOTS` (symlinks resolved, never `/`), `https://` repos without credentials, the Kubernetes RBAC granted to the gateway's identity, `ENABLED_TOOLS` |
 | What may a request contain? | JSON schemas checked by the SDK, then strict validators. The binary and its flags are fixed; targets and refs come after `--` and can't start with `-` |
-| How much may it use? | Per-tool timeouts (nmap 5 min, trivy 10 min, k8s 2 min), `MAX_CONCURRENT_SCANS`, a 64 MiB output cap; a timeout kills the scanner's whole process group. `k8s_list_images` pages 500 pods at a time, stops at 20,000 and is rate-limited to 20 QPS |
-| What comes back? | Compact typed results; secret matches stripped; only pod images and metadata from Kubernetes, never env vars or Secrets |
+| How much may it use? | Per-tool timeouts (nmap 5 min, trivy 10 min, k8s 2 min), `MAX_CONCURRENT_SCANS`, a 64 MiB output cap; a timeout kills the scanner's whole process group. The k8s tools page 500 items at a time, stop at 20,000 pods and are rate-limited to 20 QPS |
+| What comes back? | Compact typed results; secret matches stripped; only pod images, pod status and namespace metadata from Kubernetes, never env vars or Secrets |
 
 All tools are read-only. Anything that changes infrastructure would be a separate tool, marked destructive and gated behind human approval.
 
@@ -124,7 +154,7 @@ Copy `.env.example` to `.env` for local runs. In Kubernetes, set these from Conf
 | `MAX_CONCURRENT_SCANS` | all | Scans running at once. Default `2` |
 | `TRIVY_SERVER` | http | Optional Trivy server that `/readyz` checks |
 | `GITHUB_TOKEN` / `GITLAB_TOKEN` | http, stdio | Read-only token Trivy uses to clone private repos. The agent never sees it |
-| `KUBECONFIG` | http, stdio | Kubeconfig for `k8s_list_images` outside a cluster. Default `~/.kube/config`; ignored in-cluster |
+| `KUBECONFIG` | http, stdio | Kubeconfig for the k8s tools outside a cluster. Default `~/.kube/config`; ignored in-cluster |
 | `K8S_CONTEXT` | http, stdio | Optional kubeconfig context to use instead of the current one |
 | `TOOL_NAME`, `HUB_URL`, `RESULT_URL`, `CLAIM_TOKEN`, `RUN_INTERVAL` | runner | Hub endpoints and schedule (default `1h`) |
 
@@ -174,7 +204,7 @@ NMAP_ALLOWED_CIDRS=127.0.0.1/32 npx @modelcontextprotocol/inspector ./bin/runner
 }
 ```
 
-Claude Desktop doesn't load your shell's `PATH`, so set it explicitly or the scanners won't be found. For `k8s_list_images`, also set `KUBECONFIG` if your kubeconfig isn't at `~/.kube/config`, and make sure any exec credential plugin it uses (`aws`, `gcloud`, `kubelogin`) is on that `PATH`.
+Claude Desktop doesn't load your shell's `PATH`, so set it explicitly or the scanners won't be found. For the k8s tools, also set `KUBECONFIG` if your kubeconfig isn't at `~/.kube/config`, and make sure any exec credential plugin it uses (`aws`, `gcloud`, `kubelogin`) is on that `PATH`.
 
 ## Deploying to Kubernetes
 
@@ -184,22 +214,22 @@ The target layout, namespace `infra-agent`:
 - **Agent:** a separate workload (Claude Agent SDK) that calls `http://<service>.infra-agent.svc:8080/mcp` with the token from a Secret.
 - **Runner:** a CronJob running `-mode=runner`.
 - **Pod security:** `runAsNonRoot`, `readOnlyRootFilesystem` with an `emptyDir` at `/tmp`, `capabilities: drop: [ALL]` (nmap connect scans need no raw sockets), seccomp `RuntimeDefault`.
-- **RBAC for `k8s_list_images`:** a dedicated ServiceAccount bound to a ClusterRole with only `get`/`list` on `pods` (see below). Use a namespaced Role instead if the agent should only see some namespaces, and have it always pass `namespace`.
+- **RBAC for the k8s tools:** a dedicated ServiceAccount bound to a ClusterRole with only `get`/`list` on `pods` and `namespaces` (see below). Listing namespaces is cluster-scoped, so `k8s_list_namespaces` needs the ClusterRole. If the agent should only see some namespaces, drop that tool from `ENABLED_TOOLS`, use a namespaced Role for `pods` and have the agent always pass `namespace` to `k8s_list_images`.
 - **NetworkPolicy:** ingress only from the agent; egress only to `NMAP_ALLOWED_CIDRS`, the Kubernetes API server, your registries and your git host. This is the same scope the code enforces, applied a second time at the network level.
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
-metadata: { name: infra-mcp-gateway-images }
+metadata: { name: infra-mcp-gateway-k8s-read }
 rules:
   - apiGroups: [""]
-    resources: ["pods"]
+    resources: ["pods", "namespaces"]
     verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
-metadata: { name: infra-mcp-gateway-images }
-roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: infra-mcp-gateway-images }
+metadata: { name: infra-mcp-gateway-k8s-read }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: infra-mcp-gateway-k8s-read }
 subjects:
   - { kind: ServiceAccount, name: infra-mcp-gateway, namespace: infra-agent }
 ```
@@ -221,7 +251,7 @@ go test ./...                                     # unit and local integration t
 TRIVY_NETWORK_TESTS=1 go test ./internal/service  # also clones a small public repo
 ```
 
-Tests that need `nmap` or `trivy` skip themselves when the binary isn't installed. The `k8s_list_images` tests use client-go's fake clientset, so they need no cluster.
+Tests that need `nmap` or `trivy` skip themselves when the binary isn't installed. The k8s tool tests use client-go's fake clientset, so they need no cluster.
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request:
 
@@ -239,7 +269,7 @@ internal/service/           validation, scope checks, scanner invocation, result
   command.go                RunCommand: slots, output cap, process-group kill
   nmap.go                   ScanNmap, resolveTargets (CIDR scope), SummarizeNmap
   trivy.go                  ScanTrivy, allowed roots, refs, default scanners
-  k8s.go                    LoadKubernetesConfig, ListK8sImages, ParseImageRef
+  k8s.go                    LoadKubernetesConfig, ListK8sImages, ListK8sNameSpace, ParseImageRef
 internal/types/             input and output structs shared by every layer
 ```
 

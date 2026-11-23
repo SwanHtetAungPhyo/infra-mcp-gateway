@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"ai.engineer.runner/internal/types"
@@ -151,5 +152,127 @@ func TestK8sNoClusterIsToolError(t *testing.T) {
 	cs := connectK8s(t, suite)
 	if res, _ := callK8s(t, cs, map[string]any{}); !res.IsError {
 		t.Fatal("expected tool error without a cluster")
+	}
+}
+
+func ns(name string, phase corev1.NamespacePhase, lbls map[string]string) *corev1.Namespace {
+	l := map[string]string{"kubernetes.io/metadata.name": name}
+	for k, v := range lbls {
+		l[k] = v
+	}
+	return &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: l, CreationTimestamp: metav1.Now()},
+		Status:     corev1.NamespaceStatus{Phase: phase},
+	}
+}
+
+func nsCluster() *fake.Clientset {
+	crash := pod("prod", "worker", "", "", nil, "acme/worker:2")
+	crash.Status.ContainerStatuses[0].Ready = false
+	crash.Status.ContainerStatuses[0].State.Waiting = &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}
+	crash.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+	failed := pod("dev", "job", "", "", nil, "busybox")
+	failed.Status.Phase = corev1.PodFailed
+	return fake.NewClientset(
+		ns("prod", corev1.NamespaceActive, map[string]string{"team": "payments"}),
+		ns("dev", corev1.NamespaceActive, map[string]string{"team": "web"}),
+		ns("old", corev1.NamespaceTerminating, nil),
+		ns("kube-system", corev1.NamespaceActive, nil),
+		pod("prod", "api-1", "api-7f9c", "7f9c", nil, "ghcr.io/acme/api:1.2.0"),
+		crash, failed,
+		pod("kube-system", "coredns", "", "", nil, "coredns:1.11"),
+	)
+}
+
+func callNS(t *testing.T, cs *mcp.ClientSession, args map[string]any) (*mcp.CallToolResult, types.K8sNameSpaceListResult) {
+	t.Helper()
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "k8s_list_namespaces", Arguments: args})
+	if err != nil {
+		t.Fatalf("%v: protocol error %v", args, err)
+	}
+	var out types.K8sNameSpaceListResult
+	if !res.IsError {
+		b, _ := json.Marshal(res.StructuredContent)
+		if err := json.Unmarshal(b, &out); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return res, out
+}
+
+func connectNS(t *testing.T, c kubernetes.Interface) *mcp.ClientSession {
+	t.Helper()
+	ctx := context.Background()
+	suite := NewK8sToolsSuiteWithClient(c)
+	srv := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0"}, nil)
+	mcp.AddTool(srv, K8sListNameSpaceTool, suite.RunListK8sNameSpace)
+	ct, st := mcp.NewInMemoryTransports()
+	if _, err := srv.Connect(ctx, st, nil); err != nil {
+		t.Fatal(err)
+	}
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "c", Version: "0"}, nil).Connect(ctx, ct, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cs.Close() })
+	return cs
+}
+
+func TestK8sListNamespaces(t *testing.T) {
+	cs := connectNS(t, nsCluster())
+	res, out := callNS(t, cs, map[string]any{})
+	if res.IsError {
+		t.Fatalf("unexpected error: %+v", res.Content)
+	}
+	if out.Total != 4 || out.PodsScanned != 4 {
+		t.Fatalf("total=%d pods=%d: %+v", out.Total, out.PodsScanned, out)
+	}
+	byName := map[string]types.K8sNamespace{}
+	for _, n := range out.Namespaces {
+		byName[n.Name] = n
+	}
+	prod := byName["prod"]
+	if prod.Pods == nil || prod.Pods.Total != 2 || prod.Pods.Running != 2 || prod.Pods.CrashLooping != 1 || prod.Pods.NotReady != 1 {
+		t.Errorf("prod pods = %+v", prod.Pods)
+	}
+	if _, ok := prod.Labels["kubernetes.io/metadata.name"]; ok || prod.Labels["team"] != "payments" {
+		t.Errorf("prod labels = %v", prod.Labels)
+	}
+	if byName["dev"].Pods.Failed != 1 || !byName["kube-system"].System || byName["old"].Phase != "Terminating" {
+		t.Errorf("namespaces = %+v", byName)
+	}
+	if !strings.Contains(out.Summary, "dev, prod") {
+		t.Errorf("summary = %q", out.Summary)
+	}
+}
+
+func TestK8sListNamespacesFilters(t *testing.T) {
+	cs := connectNS(t, nsCluster())
+	for _, tc := range []struct {
+		args map[string]any
+		want []string
+	}{
+		{map[string]any{"exclude_system": true}, []string{"dev", "old", "prod"}},
+		{map[string]any{"label_selector": "team=payments"}, []string{"prod"}},
+		{map[string]any{"name_contains": "kube"}, []string{"kube-system"}},
+		{map[string]any{"phase": "Terminating"}, []string{"old"}},
+		{map[string]any{"max_results": 2}, []string{"dev", "kube-system"}},
+	} {
+		_, out := callNS(t, cs, tc.args)
+		var got []string
+		for _, n := range out.Namespaces {
+			got = append(got, n.Name)
+		}
+		if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+			t.Errorf("%v: got %v want %v", tc.args, got, tc.want)
+		}
+	}
+	if _, out := callNS(t, cs, map[string]any{"skip_pod_counts": true}); out.PodsScanned != 0 || out.Namespaces[0].Pods != nil {
+		t.Errorf("skip_pod_counts: %+v", out)
+	}
+	for _, args := range []map[string]any{{"phase": "Gone"}, {"label_selector": "a in ("}, {"max_results": 5000}} {
+		if res, _ := callNS(t, cs, args); !res.IsError {
+			t.Errorf("%v: expected tool error", args)
+		}
 	}
 }

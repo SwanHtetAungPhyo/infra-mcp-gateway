@@ -33,22 +33,33 @@ var registry = []entry{
 			mcp.AddTool(server, TrivyTool, RunTrivy)
 		},
 	},
+	// k8s tools talk to the API server directly (no binaries) and share one
+	// lazily created client.
 	{
 		name: K8sListImagesTool.Name,
-		// Talks to the API server directly; no binaries needed.
 		add: func(server *mcp.Server) {
-			mcp.AddTool(server, K8sListImagesTool, NewK8sToolsSuite().RunListK8sImages)
+			mcp.AddTool(server, K8sListImagesTool, k8sSuite.RunListK8sImages)
+		},
+	},
+	{
+		name: K8sListNameSpaceTool.Name,
+		add: func(server *mcp.Server) {
+			mcp.AddTool(server, K8sListNameSpaceTool, k8sSuite.RunListK8sNameSpace)
 		},
 	},
 }
+
+var k8sSuite = NewK8sToolsSuite()
 
 func RegisterAll(s *mcp.Server, enabled []string) (bins []string, err error) {
 	want := map[string]bool{}
 	for _, n := range enabled {
 		want[n] = true
 	}
+	// Decide "all tools" once: want shrinks below as names are matched.
+	all := len(want) == 0
 	for _, e := range registry {
-		if len(want) == 0 || want[e.name] {
+		if all || want[e.name] {
 			e.add(s)
 			bins = append(bins, e.bins...)
 			delete(want, e.name)

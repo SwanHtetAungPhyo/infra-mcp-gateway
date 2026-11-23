@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -109,29 +110,177 @@ func validDNSLabel(s string) bool {
 	return true
 }
 
+var K8sNamespacePhases = []string{"Active", "Terminating"}
+
+// k8sSystemNamespaces are created by Kubernetes itself.
+var k8sSystemNamespaces = map[string]bool{"kube-system": true, "kube-public": true, "kube-node-lease": true, "default": true}
+
+// ListK8sNameSpace lists namespaces with their phase, age, labels and, unless
+// skipped, a per-namespace breakdown of pod health.
+func ListK8sNameSpace(ctx context.Context, cs kubernetes.Interface, in types.K8sNameSpaceListInput) (*types.K8sNameSpaceListResult, error) {
+	if in.LabelSelector != "" {
+		if _, err := labels.Parse(in.LabelSelector); err != nil {
+			return nil, fmt.Errorf("label_selector: %w", err)
+		}
+	}
+	if in.Phase != "" && !slices.Contains(K8sNamespacePhases, in.Phase) {
+		return nil, fmt.Errorf("phase must be one of %v", K8sNamespacePhases)
+	}
+	switch {
+	case in.MaxResults == 0:
+		in.MaxResults = k8sDefaultMax
+	case in.MaxResults < 0 || in.MaxResults > k8sHardMax:
+		return nil, fmt.Errorf("max_results must be between 1 and %d", k8sHardMax)
+	}
+
+	var nss []corev1.Namespace
+	opts := metav1.ListOptions{LabelSelector: in.LabelSelector, Limit: k8sPageSize}
+	for {
+		list, err := cs.CoreV1().Namespaces().List(ctx, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list namespaces: %w", err)
+		}
+		nss = append(nss, list.Items...)
+		if list.Continue == "" {
+			break
+		}
+		opts.Continue = list.Continue
+	}
+
+	res := &types.K8sNameSpaceListResult{}
+	now := time.Now()
+	for _, ns := range nss {
+		system := k8sSystemNamespaces[ns.Name]
+		if in.ExcludeSystem && system ||
+			in.NameContains != "" && !strings.Contains(ns.Name, in.NameContains) ||
+			in.Phase != "" && string(ns.Status.Phase) != in.Phase {
+			continue
+		}
+		lbls := maps.Clone(ns.Labels)
+		delete(lbls, "kubernetes.io/metadata.name") // always equals the name
+		res.Namespaces = append(res.Namespaces, types.K8sNamespace{
+			Name:      ns.Name,
+			Phase:     string(ns.Status.Phase),
+			Age:       shortAge(now.Sub(ns.CreationTimestamp.Time)),
+			CreatedAt: ns.CreationTimestamp.UTC().Format(time.RFC3339),
+			System:    system,
+			Labels:    lbls,
+		})
+	}
+	slices.SortFunc(res.Namespaces, func(a, b types.K8sNamespace) int { return strings.Compare(a.Name, b.Name) })
+	res.Total = len(res.Namespaces)
+	if res.Total > in.MaxResults {
+		res.Namespaces, res.Truncated = res.Namespaces[:in.MaxResults], true
+	}
+
+	var unhealthy []string
+	if !in.SkipPodCounts && len(res.Namespaces) > 0 {
+		// One cluster-wide pod list is cheaper than one call per namespace.
+		pods, capped, err := listPods(ctx, cs, "", metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
+		res.PodsScanned = len(pods)
+		res.Truncated = res.Truncated || capped
+		counts := map[string]*types.K8sPodCounts{}
+		for i := range res.Namespaces {
+			c := &types.K8sPodCounts{}
+			res.Namespaces[i].Pods = c
+			counts[res.Namespaces[i].Name] = c
+		}
+		for i := range pods {
+			if c := counts[pods[i].Namespace]; c != nil {
+				countPod(c, &pods[i])
+			}
+		}
+		for _, ns := range res.Namespaces {
+			if c := ns.Pods; c.Failed+c.CrashLooping+c.NotReady > 0 {
+				unhealthy = append(unhealthy, ns.Name)
+			}
+		}
+	}
+
+	res.Summary = fmt.Sprintf("%d namespaces", res.Total)
+	if res.PodsScanned > 0 {
+		res.Summary += fmt.Sprintf(", %d pods", res.PodsScanned)
+	}
+	if len(unhealthy) > 0 {
+		res.Summary += fmt.Sprintf("; failing, crash-looping or not-ready pods in: %s", strings.Join(unhealthy, ", "))
+	}
+	if res.Truncated {
+		res.Summary += "; output truncated, narrow with label_selector or name_contains"
+	}
+	return res, nil
+}
+
+func countPod(c *types.K8sPodCounts, p *corev1.Pod) {
+	c.Total++
+	switch p.Status.Phase {
+	case corev1.PodRunning:
+		c.Running++
+		for _, cond := range p.Status.Conditions {
+			if cond.Type == corev1.PodReady && cond.Status != corev1.ConditionTrue {
+				c.NotReady++
+			}
+		}
+	case corev1.PodPending:
+		c.Pending++
+	case corev1.PodSucceeded:
+		c.Succeeded++
+	case corev1.PodFailed:
+		c.Failed++
+	}
+	for _, s := range p.Status.ContainerStatuses {
+		if s.State.Waiting != nil && s.State.Waiting.Reason == "CrashLoopBackOff" {
+			c.CrashLooping++
+			break
+		}
+	}
+}
+
+// shortAge formats a duration like kubectl: 45s, 12m, 5h, 41d.
+func shortAge(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
+}
+
+// listPods pages through pods in namespace ("" = all), stopping at k8sMaxPods.
+// capped reports whether it stopped early.
+func listPods(ctx context.Context, cs kubernetes.Interface, namespace string, opts metav1.ListOptions) (pods []corev1.Pod, capped bool, err error) {
+	opts.Limit = k8sPageSize
+	for {
+		list, err := cs.CoreV1().Pods(namespace).List(ctx, opts)
+		if err != nil {
+			return nil, false, fmt.Errorf("list pods: %w", err)
+		}
+		pods = append(pods, list.Items...)
+		if list.Continue == "" {
+			return pods, false, nil
+		}
+		if len(pods) >= k8sMaxPods {
+			return pods, true, nil
+		}
+		opts.Continue = list.Continue
+	}
+}
+
 // ListK8sImages lists pods (paging through the API) and summarises their images.
 func ListK8sImages(ctx context.Context, cs kubernetes.Interface, in types.K8sImageListInput) (*types.K8sImageListResult, error) {
 	if err := normalizeK8sInput(&in); err != nil {
 		return nil, err
 	}
 
-	var pods []corev1.Pod
-	opts := metav1.ListOptions{LabelSelector: in.LabelSelector, FieldSelector: in.FieldSelector, Limit: k8sPageSize}
-	capped := false
-	for {
-		list, err := cs.CoreV1().Pods(in.Namespace).List(ctx, opts)
-		if err != nil {
-			return nil, fmt.Errorf("list pods: %w", err)
-		}
-		pods = append(pods, list.Items...)
-		if list.Continue == "" {
-			break
-		}
-		if len(pods) >= k8sMaxPods {
-			capped = true
-			break
-		}
-		opts.Continue = list.Continue
+	pods, capped, err := listPods(ctx, cs, in.Namespace, metav1.ListOptions{LabelSelector: in.LabelSelector, FieldSelector: in.FieldSelector})
+	if err != nil {
+		return nil, err
 	}
 
 	res := &types.K8sImageListResult{Namespace: in.Namespace, GroupBy: in.GroupBy, PodsScanned: len(pods), Truncated: capped}
