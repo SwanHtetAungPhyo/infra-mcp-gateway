@@ -33,6 +33,13 @@ var registry = []entry{
 			mcp.AddTool(server, TrivyTool, RunTrivy)
 		},
 	},
+	{
+		name: K8sListImagesTool.Name,
+		// Talks to the API server directly; no binaries needed.
+		add: func(server *mcp.Server) {
+			mcp.AddTool(server, K8sListImagesTool, NewK8sToolsSuite().RunListK8sImages)
+		},
+	},
 }
 
 func RegisterAll(s *mcp.Server, enabled []string) (bins []string, err error) {
