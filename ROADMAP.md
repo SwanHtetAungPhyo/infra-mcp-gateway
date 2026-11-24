@@ -45,13 +45,13 @@ Read-only RBAC: `get/list/watch` on the resources below, never `secrets` data.
 ### Inventory
 - [x] **P1** `k8s_list_contexts` — kubeconfig contexts the server may use (respecting `K8S_ALLOWED_CONTEXTS`); `context` input on every k8s tool
 - [x] **P1** `k8s_list_namespaces` — with labels, phase, age, pod health counts
-- [ ] **P1** `k8s_nodes_list` — version, OS/arch, capacity vs allocatable, conditions, taints
-- [ ] **P1** `k8s_workloads_list` — Deployments, StatefulSets, DaemonSets, Jobs, CronJobs with desired/ready replicas and images
-- [ ] **P1** `k8s_pods_list` — phase, restarts, last termination reason (CrashLoopBackOff, OOMKilled), node
-- [ ] **P1** `k8s_services_list` / `k8s_ingresses_list` — type, ports, external IPs/hosts, TLS
-- [ ] **P1** `k8s_resource_get` — generic get for any kind (incl. CRDs) via the dynamic client, returned as trimmed YAML (no `managedFields`, Secret data stripped)
-- [ ] **P2** `k8s_helm_releases_list` — from Helm release secrets (metadata only)
-- [ ] **P2** `k8s_crds_list`
+- [x] **P1** `k8s_list_nodes` — version, OS/arch, capacity vs allocatable, conditions, taints
+- [x] **P1** `k8s_list_workloads` — Deployments, StatefulSets, DaemonSets, Jobs, CronJobs with desired/ready replicas and images
+- [x] **P1** `k8s_list_pods` — phase, restarts, last termination reason (CrashLoopBackOff, OOMKilled), node
+- [x] **P1** `k8s_list_services` / `k8s_list_ingresses` — type, ports, external IPs/hosts, TLS
+- [x] **P1** `k8s_get_resource` — generic get for any kind (incl. CRDs) via the dynamic client, returned as trimmed YAML (no `managedFields`, Secret data stripped)
+- [x] **P2** `k8s_list_helm_releases` — from Helm release secrets (metadata only)
+- [x] **P2** `k8s_list_crds`
 
 ### Troubleshooting
 - [ ] **P1** `k8s_events_list` — warnings first, filter by namespace/object

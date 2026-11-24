@@ -33,8 +33,6 @@ var registry = []entry{
 			mcp.AddTool(server, TrivyTool, RunTrivy)
 		},
 	},
-	// k8s tools talk to the API server directly (no binaries) and share one
-	// lazily created client.
 	{
 		name: K8sListContextsTool.Name,
 		add: func(server *mcp.Server) {
@@ -56,6 +54,19 @@ var registry = []entry{
 }
 
 var k8sSuite = NewK8sToolsSuite()
+
+// K8sSuite returns the suite the k8s tools use, so other MCP features
+// (resources) share its clients, context allowlist and lazy config loading.
+func K8sSuite() *K8sToolsSuite { return k8sSuite }
+
+func init() {
+	for _, t := range k8sInventoryTools {
+		registry = append(registry, entry{
+			name: t.Name,
+			add:  func(server *mcp.Server) { k8sSuite.addInventoryTool(server, t.Name) },
+		})
+	}
+}
 
 func RegisterAll(s *mcp.Server, enabled []string) (bins []string, err error) {
 	want := map[string]bool{}

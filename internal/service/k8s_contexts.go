@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"ai.engineer.runner/internal/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -27,6 +29,14 @@ const (
 	k8sCheckParallel = 4
 )
 
+// K8sClients are the clients for one context: typed for core kinds, dynamic
+// for any kind (CRDs), metadata for listing objects without their data.
+type K8sClients struct {
+	Typed    kubernetes.Interface
+	Dynamic  dynamic.Interface  // nil when unavailable (some static sources)
+	Metadata metadata.Interface // nil when unavailable
+}
+
 // K8sSource knows which contexts exist, which one is the default, which ones
 // the agent may use, and how to build a client for each. Clients are cached.
 type K8sSource struct {
@@ -34,10 +44,10 @@ type K8sSource struct {
 	contexts []types.K8sContext
 	def      string
 	allowed  func(string) bool
-	build    func(name string, timeout time.Duration) (kubernetes.Interface, error)
+	build    func(name string, timeout time.Duration) (*K8sClients, error)
 
 	mu      sync.Mutex
-	clients map[string]kubernetes.Interface
+	clients map[string]*K8sClients
 }
 
 // LoadK8sSource uses the in-cluster service account when running in a pod,
@@ -78,9 +88,8 @@ func inClusterSource(cfg *rest.Config) *K8sSource {
 		contexts: []types.K8sContext{{Name: K8sInClusterContext, Server: cfg.Host, Auth: "service-account"}},
 		def:      K8sInClusterContext,
 		allowed:  func(n string) bool { return n == K8sInClusterContext },
-		build: func(_ string, timeout time.Duration) (kubernetes.Interface, error) {
-			c := rest.CopyConfig(cfg)
-			return newClientset(c, timeout)
+		build: func(_ string, timeout time.Duration) (*K8sClients, error) {
+			return newClients(rest.CopyConfig(cfg), timeout)
 		},
 	}
 }
@@ -97,19 +106,29 @@ func kubeconfigSource(raw *clientcmdapi.Config, def string, allowed func(string)
 	}
 	return &K8sSource{
 		kind: "kubeconfig", contexts: ctxs, def: def, allowed: allowed,
-		build: func(name string, timeout time.Duration) (kubernetes.Interface, error) {
+		build: func(name string, timeout time.Duration) (*K8sClients, error) {
 			cfg, err := clientcmd.NewNonInteractiveClientConfig(*raw, name, &clientcmd.ConfigOverrides{}, nil).ClientConfig()
 			if err != nil {
 				return nil, fmt.Errorf("context %q: %w", name, err)
 			}
-			return newClientset(cfg, timeout)
+			return newClients(cfg, timeout)
 		},
 	}
 }
 
-// NewStaticK8sSource serves ready clients by context name (tests, custom setups).
-// Every given context is allowed; def is used when a call names none.
+// NewStaticK8sSource serves ready typed clients by context name (tests,
+// custom setups). Every given context is allowed; def is used when a call
+// names none.
 func NewStaticK8sSource(def string, clients map[string]kubernetes.Interface) *K8sSource {
+	full := map[string]*K8sClients{}
+	for n, c := range clients {
+		full[n] = &K8sClients{Typed: c}
+	}
+	return NewStaticK8sSourceClients(def, full)
+}
+
+// NewStaticK8sSourceClients is NewStaticK8sSource with dynamic/metadata clients.
+func NewStaticK8sSourceClients(def string, clients map[string]*K8sClients) *K8sSource {
 	var ctxs []types.K8sContext
 	for name := range clients {
 		ctxs = append(ctxs, types.K8sContext{Name: name, Auth: "static"})
@@ -117,16 +136,28 @@ func NewStaticK8sSource(def string, clients map[string]kubernetes.Interface) *K8
 	return &K8sSource{
 		kind: "static", contexts: ctxs, def: def,
 		allowed: func(n string) bool { _, ok := clients[n]; return ok },
-		build: func(name string, _ time.Duration) (kubernetes.Interface, error) {
+		build: func(name string, _ time.Duration) (*K8sClients, error) {
 			return clients[name], nil
 		},
 	}
 }
 
-func newClientset(cfg *rest.Config, timeout time.Duration) (kubernetes.Interface, error) {
+func newClients(cfg *rest.Config, timeout time.Duration) (*K8sClients, error) {
 	cfg.QPS, cfg.Burst = 20, 40
 	cfg.Timeout = timeout
-	return kubernetes.NewForConfig(cfg)
+	typed, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	meta, err := metadata.NewForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &K8sClients{Typed: typed, Dynamic: dyn, Metadata: meta}, nil
 }
 
 // parseAllowedContexts: "" = only def, "*" = all, else the listed names.
@@ -190,8 +221,17 @@ func (s *K8sSource) Resolve(name string) (string, error) {
 	return name, nil
 }
 
-// Client returns a cached client for the context ("" = default) and its resolved name.
+// Client returns the cached typed client for the context ("" = default) and its resolved name.
 func (s *K8sSource) Client(name string) (kubernetes.Interface, string, error) {
+	c, name, err := s.Clients(name)
+	if err != nil {
+		return nil, "", err
+	}
+	return c.Typed, name, nil
+}
+
+// Clients returns every cached client for the context ("" = default) and its resolved name.
+func (s *K8sSource) Clients(name string) (*K8sClients, string, error) {
 	name, err := s.Resolve(name)
 	if err != nil {
 		return nil, "", err
@@ -206,7 +246,7 @@ func (s *K8sSource) Client(name string) (kubernetes.Interface, string, error) {
 		return nil, "", err // not cached: a fixed kubeconfig or login works on retry
 	}
 	if s.clients == nil {
-		s.clients = map[string]kubernetes.Interface{}
+		s.clients = map[string]*K8sClients{}
 	}
 	s.clients[name] = c
 	return c, name, nil
@@ -275,7 +315,7 @@ func checkContext(s *K8sSource, c *types.K8sContext) {
 		c.Error = trimErr(err)
 		return
 	}
-	v, err := cs.Discovery().ServerVersion()
+	v, err := cs.Typed.Discovery().ServerVersion()
 	if err != nil {
 		c.Error = trimErr(err)
 		return

@@ -61,6 +61,15 @@ var (
 			OpenWorldHint: boolPtr(true),
 		},
 	}
+	K8sNodeListTool = &mcp.Tool{
+		Name:        "k8s_list_nodes",
+		Title:       "List Kubernetes Nodes",
+		Description: "",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:  true,
+			OpenWorldHint: boolPtr(true),
+		},
+	}
 )
 
 func k8sInputSchema() *jsonschema.Schema {
@@ -108,13 +117,13 @@ func NewK8sToolsSuiteWithSource(src *service.K8sSource) *K8sToolsSuite {
 	return &K8sToolsSuite{load: func() (*service.K8sSource, error) { return src, nil }}
 }
 
-func (ks *K8sToolsSuite) source() (*service.K8sSource, error) {
+func (ks *K8sToolsSuite) Source() (*service.K8sSource, error) {
 	ks.once.Do(func() { ks.src, ks.err = ks.load() })
 	return ks.src, ks.err
 }
 
 func (ks *K8sToolsSuite) clientset(name string) (kubernetes.Interface, string, error) {
-	src, err := ks.source()
+	src, err := ks.Source()
 	if err != nil {
 		return nil, "", err
 	}
@@ -123,7 +132,7 @@ func (ks *K8sToolsSuite) clientset(name string) (kubernetes.Interface, string, e
 
 // RunListK8sContexts is the MCP handler for k8s_list_contexts.
 func (ks *K8sToolsSuite) RunListK8sContexts(_ context.Context, _ *mcp.CallToolRequest, in types.K8sContextListInput) (*mcp.CallToolResult, *types.K8sContextListResult, error) {
-	src, err := ks.source()
+	src, err := ks.Source()
 	if err != nil {
 		return nil, nil, fmt.Errorf("k8s_list_contexts: %w", err)
 	}

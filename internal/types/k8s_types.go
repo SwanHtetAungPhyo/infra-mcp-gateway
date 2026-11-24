@@ -134,4 +134,118 @@ type (
 		Version   string `json:"version,omitempty"`
 		Error     string `json:"error,omitempty"`
 	}
+
+	// K8sNodeListInput is the argument schema for k8s_list_nodes.
+	K8sNodeListInput struct {
+		Context       string `json:"context,omitempty" jsonschema:"kubeconfig context to use, from k8s_list_contexts; default is the gateway's default context"`
+		LabelSelector string `json:"label_selector,omitempty" jsonschema:"Kubernetes label selector on nodes, e.g. node.kubernetes.io/instance-type=m5.large or topology.kubernetes.io/zone=eu-west-1a"`
+		NameContains  string `json:"name_contains,omitempty" jsonschema:"only nodes whose name contains this text"`
+		Role          string `json:"role,omitempty" jsonschema:"only nodes with this role from node-role.kubernetes.io/<role> labels, e.g. control-plane or worker"`
+		Status        string `json:"status,omitempty" jsonschema:"only nodes in this state: ready, not_ready (NotReady or Unknown) or cordoned (unschedulable); default all"`
+		IncludeLabels bool   `json:"include_labels,omitempty" jsonschema:"also return every node label (verbose)"`
+		SkipPodCounts bool   `json:"skip_pod_counts,omitempty" jsonschema:"skip listing pods; faster, but pod counts and CPU/memory requests stay empty"`
+		MaxResults    int    `json:"max_results,omitempty" jsonschema:"maximum nodes to return, 1-1000; default 200"`
+	}
+
+	// K8sNodeListResult is the compact result of k8s_list_nodes.
+	K8sNodeListResult struct {
+		Context     string    `json:"context,omitempty"`
+		Summary     string    `json:"summary"`
+		Total       int       `json:"total"` // nodes after filters
+		PodsScanned int       `json:"pods_scanned,omitempty"`
+		Truncated   bool      `json:"truncated,omitempty"`
+		Nodes       []K8sNode `json:"nodes"`
+	}
+
+	// K8sNode is one node. Requested values are the sum of pod requests on the
+	// node (as kubectl describe node reports them), not live usage.
+	K8sNode struct {
+		Name             string            `json:"name"`
+		Status           string            `json:"status"` // Ready | NotReady | Unknown
+		Schedulable      bool              `json:"schedulable"`
+		Roles            []string          `json:"roles,omitempty"`
+		Problems         []string          `json:"problems,omitempty"` // e.g. MemoryPressure, DiskPressure, NetworkUnavailable
+		Taints           []string          `json:"taints,omitempty"`   // key=value:Effect
+		KubeletVersion   string            `json:"kubelet_version"`
+		OSImage          string            `json:"os_image,omitempty"`
+		Kernel           string            `json:"kernel,omitempty"`
+		ContainerRuntime string            `json:"container_runtime,omitempty"`
+		Arch             string            `json:"arch,omitempty"`
+		InternalIP       string            `json:"internal_ip,omitempty"`
+		ExternalIP       string            `json:"external_ip,omitempty"`
+		Zone             string            `json:"zone,omitempty"`
+		InstanceType     string            `json:"instance_type,omitempty"`
+		Age              string            `json:"age"`
+		CreatedAt        string            `json:"created_at"`
+		CPUCapacity      string            `json:"cpu_capacity"`
+		CPUAllocatable   string            `json:"cpu_allocatable"`
+		CPURequested     string            `json:"cpu_requested,omitempty"`
+		CPURequestedPct  *int              `json:"cpu_requested_pct,omitempty"`
+		MemCapacity      string            `json:"memory_capacity"`
+		MemAllocatable   string            `json:"memory_allocatable"`
+		MemRequested     string            `json:"memory_requested,omitempty"`
+		MemRequestedPct  *int              `json:"memory_requested_pct,omitempty"`
+		PodsAllocatable  int64             `json:"pods_allocatable"`
+		Pods             *int              `json:"pods,omitempty"` // non-terminated pods on the node
+		Labels           map[string]string `json:"labels,omitempty"`
+	}
+
+	// K8sWorkloadListInput is the argument schema for k8s_list_workloads.
+	K8sWorkloadListInput struct {
+		Context            string   `json:"context,omitempty" jsonschema:"kubeconfig context to use, from k8s_list_contexts; default is the gateway's default context"`
+		Namespace          string   `json:"namespace,omitempty" jsonschema:"only workloads in this namespace; empty means all namespaces"`
+		Kinds              []string `json:"kinds,omitempty" jsonschema:"subset of Deployment, StatefulSet, DaemonSet, CronJob, Job; default all"`
+		LabelSelector      string   `json:"label_selector,omitempty" jsonschema:"Kubernetes label selector on the workload objects, e.g. app=api"`
+		NameContains       string   `json:"name_contains,omitempty" jsonschema:"only workloads whose name contains this text"`
+		UnhealthyOnly      bool     `json:"unhealthy_only,omitempty" jsonschema:"only workloads whose status is degraded, failed or progressing"`
+		IncludeCronJobJobs bool     `json:"include_cronjob_jobs,omitempty" jsonschema:"also list Jobs created by CronJobs (hidden by default, they pile up)"`
+		MaxResults         int      `json:"max_results,omitempty" jsonschema:"maximum workloads to return, 1-1000; default 200"`
+	}
+
+	// K8sWorkloadListResult is the compact result of k8s_list_workloads.
+	K8sWorkloadListResult struct {
+		Context   string         `json:"context,omitempty"`
+		Namespace string         `json:"namespace"` // "" = all namespaces
+		Summary   string         `json:"summary"`
+		Total     int            `json:"total"`  // after filters
+		Counts    map[string]int `json:"counts"` // by status
+		Truncated bool           `json:"truncated,omitempty"`
+		Errors    []string       `json:"errors,omitempty"` // kinds that could not be listed, e.g. RBAC
+		Workloads []K8sWorkload  `json:"workloads"`
+	}
+
+	// K8sWorkload is one Deployment, StatefulSet, DaemonSet, Job or CronJob.
+	//
+	// status: healthy | progressing | degraded | failed | scaled_to_zero |
+	// running | complete | suspended | scheduled
+	K8sWorkload struct {
+		Namespace string   `json:"namespace"`
+		Kind      string   `json:"kind"`
+		Name      string   `json:"name"`
+		Status    string   `json:"status"`
+		Message   string   `json:"message,omitempty"` // why it isn't healthy
+		Images    []string `json:"images"`
+		Age       string   `json:"age"`
+		CreatedAt string   `json:"created_at"`
+
+		// Deployment, StatefulSet, DaemonSet
+		Desired   *int32 `json:"desired,omitempty"`
+		Ready     *int32 `json:"ready,omitempty"`
+		Updated   *int32 `json:"updated,omitempty"`
+		Available *int32 `json:"available,omitempty"`
+		Paused    bool   `json:"paused,omitempty"`
+
+		// Job
+		Completions *int32 `json:"completions,omitempty"`
+		Succeeded   *int32 `json:"succeeded,omitempty"`
+		Failed      *int32 `json:"failed,omitempty"`
+		Active      *int32 `json:"active,omitempty"` // also CronJob
+		Owner       string `json:"owner,omitempty"`  // CronJob that created the Job
+
+		// CronJob
+		Schedule       string `json:"schedule,omitempty"`
+		Suspended      bool   `json:"suspended,omitempty"`
+		LastSchedule   string `json:"last_schedule,omitempty"`
+		LastSuccessful string `json:"last_successful,omitempty"`
+	}
 )

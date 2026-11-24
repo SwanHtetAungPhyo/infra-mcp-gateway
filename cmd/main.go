@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -17,6 +19,7 @@ import (
 
 	"ai.engineer.runner/internal/service"
 	tools2 "ai.engineer.runner/internal/tools"
+	"ai.engineer.runner/internal/types"
 	"github.com/joho/godotenv"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/rs/zerolog"
@@ -148,11 +151,101 @@ func newMCPServer() (*mcp.Server, []string, error) {
 
 	server.AddReceivingMiddleware(createLoggingMiddleware())
 
-	bins, err := tools2.RegisterAll(server, enabledTools())
+	enabled := enabledTools()
+	bins, err := tools2.RegisterAll(server, enabled)
 	if err != nil {
 		return nil, nil, err
 	}
+	if k8sEnabled(enabled) {
+		addK8sResources(server, tools2.K8sSuite())
+	}
 	return server, bins, nil
+}
+
+// ---------- MCP resources ----------
+
+// k8sEnabled reports whether any k8s tool is enabled. Resources read the
+// cluster too, so they follow the same switch.
+func k8sEnabled(enabled []string) bool {
+	if len(enabled) == 0 {
+		return true
+	}
+	for _, n := range enabled {
+		if strings.HasPrefix(n, "k8s_") {
+			return true
+		}
+	}
+	return false
+}
+
+// addK8sResources registers read-only cluster snapshots. They reuse the k8s
+// tools' service functions, clients and K8S_ALLOWED_CONTEXTS.
+func addK8sResources(server *mcp.Server, ks *tools2.K8sToolsSuite) {
+	nodes := jsonResource(ks, func(ctx context.Context, c *service.K8sClients) (*types.K8sNodeListResult, error) {
+		return service.ListK8sNodes(ctx, c.Typed, types.K8sNodeListInput{})
+	})
+	server.AddResource(&mcp.Resource{
+		URI:         "k8s://default/nodes",
+		Name:        "k8s-nodes",
+		Title:       "Kubernetes nodes (default context)",
+		MIMEType:    "application/json",
+		Description: "Nodes in the default cluster with health, versions, capacity and pod requests. For filters use k8s_list_nodes.",
+	}, nodes)
+	server.AddResourceTemplate(&mcp.ResourceTemplate{
+		URITemplate: "k8s://contexts/{context}/nodes",
+		Name:        "k8s-context-nodes",
+		Title:       "Kubernetes nodes for a context",
+		MIMEType:    "application/json",
+		Description: "Same as k8s://default/nodes for a context from k8s_list_contexts (URL-encode the name). Only contexts in K8S_ALLOWED_CONTEXTS work.",
+	}, nodes)
+}
+
+// contextFromURI returns the context in "k8s://contexts/<name>/...", or ""
+// (the default context) for any other URI.
+func contextFromURI(uri string) string {
+	u, err := url.Parse(uri)
+	if err != nil || u.Host != "contexts" {
+		return ""
+	}
+	// Split the still-encoded path: names like EKS ARNs contain an encoded "/".
+	first, _, _ := strings.Cut(strings.TrimPrefix(u.EscapedPath(), "/"), "/")
+	name, _ := url.PathUnescape(first)
+	return name
+}
+
+// jsonResource turns a "fetch data for a context" function into a resource
+// handler: resolves the context (allowlist applies), adds the timeout and
+// returns the data as JSON. Errors are logged by the logging middleware.
+func jsonResource[T any](ks *tools2.K8sToolsSuite, fetch func(ctx context.Context, c *service.K8sClients) (*T, error)) mcp.ResourceHandler {
+	return func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		src, err := ks.Source()
+		if err != nil {
+			return nil, err
+		}
+		c, _, err := src.Clients(contextFromURI(req.Params.URI))
+		if err != nil {
+			return nil, err
+		}
+		ctx, cancel := context.WithTimeout(ctx, tools2.K8sTimeout)
+		defer cancel()
+
+		data, err := fetch(ctx, c)
+		if err != nil {
+			return nil, err
+		}
+		b, err := json.MarshalIndent(data, "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		return &mcp.ReadResourceResult{
+			Cacheable: mcp.Cacheable{TTLMs: 30_000, CacheScope: "private"}, // live cluster data
+			Contents: []*mcp.ResourceContents{{
+				URI:      req.Params.URI,
+				MIMEType: "application/json",
+				Text:     string(b),
+			}},
+		}, nil
+	}
 }
 
 // enabledTools reads ENABLED_TOOLS ("nmap_scan,trivy_scan"). Unset or blank

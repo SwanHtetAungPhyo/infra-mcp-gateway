@@ -9,7 +9,7 @@ The agent decides **what** to look at. The gateway decides **what is allowed**, 
 ```
  infra agent ──tools/call + Bearer──▶ infra-mcp-gateway ──▶ nmap · nmap-formatter · trivy ──▶ allowed targets
  (Claude)                               auth · scope · limits                               hosts · images · git repos
-                                                         └──▶ Kubernetes API (list pods, namespaces) ──▶ images · namespace health
+                                                         └──▶ Kubernetes API (read-only) ──▶ nodes · workloads · pods · services · CRDs
 
  runner (cron) ──claim / push──▶ your hub        same binary, no MCP: a scheduled baseline scan
 ```
@@ -140,6 +140,38 @@ Namespaces with their phase, age, labels and pod health. With no arguments it li
 - Pod counts come from one paged, cluster-wide pod list (500 per page, up to 20,000), not one call per namespace.
 - A natural next step is `k8s_list_images` with `namespace` set to a namespace it returns.
 
+### Kubernetes inventory
+
+More read-only tools with the same pattern: optional `context`, filters, `max_results` (1–1000, default 200), paging through the API, and a `summary` that names whatever needs attention. Bad input is rejected before the API is called.
+
+| Tool | Returns | Main filters | Summary flags |
+|---|---|---|---|
+| `k8s_list_nodes` | Ready/NotReady, cordoned, roles, taints, pressure conditions, kubelet/OS/kernel/runtime, IPs, zone, instance type, CPU/memory capacity vs allocatable, pod requests per node with % | `label_selector`, `role`, `status` (`ready`/`not_ready`/`cordoned`), `name_contains`, `skip_pod_counts`, `include_labels` | unhealthy nodes, kubelet version skew, cluster-wide request % |
+| `k8s_list_workloads` | Deployments, StatefulSets, DaemonSets, CronJobs, Jobs: status, desired/ready/updated/available, images, why it isn't healthy; CronJob schedule and last runs | `namespace`, `kinds`, `label_selector`, `name_contains`, `unhealthy_only`, `include_cronjob_jobs` | degraded, failed and progressing workloads |
+| `k8s_list_pods` | kubectl-style status (`CrashLoopBackOff`, `ImagePullBackOff`, `OOMKilled`, `Init:…`, `Evicted`), ready, restarts, last termination (reason, exit code, time), node, workload, IP, QoS | `namespace`, `label_selector`, `field_selector`, `node`, `name_contains`, `problems_only` | problem pods |
+| `k8s_list_services` | type, cluster IP, external IPs/hostnames, ports (`80:30080/TCP->8080`), selector, ready endpoints | `namespace`, `type`, `exposed_only`, `label_selector`, `name_contains` | services exposed outside the cluster, services with no ready endpoints |
+| `k8s_list_ingresses` | class, hosts, rules (`host/path -> service:port`), TLS hosts and secret names, load balancer addresses | `namespace`, `host_contains`, `label_selector` | hosts served without TLS |
+| `k8s_get_resource` | any object, CRDs included, as YAML; without `name`, a list of names | `kind` (`Deployment`, `svc`, `certificates.cert-manager.io`), `api_version`, `name`, `namespace`, `label_selector` | what was redacted |
+| `k8s_list_crds` | CRDs: group, kind, scope, versions (storage / not served / deprecated), short names, established | `group_contains` | CRDs that aren't established |
+| `k8s_list_helm_releases` | Helm 3 releases: latest revision, status, revisions kept, last update | `namespace`, `name_contains`, `problems_only` | failed and stuck `pending-*` releases |
+
+```json
+{ "tool": "k8s_list_pods", "arguments": { "namespace": "prod", "problems_only": true } }
+```
+
+```json
+{ "summary": "1 pods in namespace prod (1 CrashLoopBackOff); 1 need attention: prod/api-7f9c-x2 (CrashLoopBackOff)",
+  "pods": [{ "namespace": "prod", "name": "api-7f9c-x2", "workload": "prod/Deployment/api", "node": "w2",
+             "status": "CrashLoopBackOff", "problem": true, "ready": "0/1", "restarts": 7,
+             "last_termination": { "container": "api", "reason": "OOMKilled", "exit_code": 137 } }] }
+```
+
+What these tools never return:
+
+- **`k8s_get_resource`** drops `managedFields`, and replaces with `<redacted>` the values of Secret `data`/`stringData`, every literal `env[].value` (in any pod template), and the `kubectl.kubernetes.io/last-applied-configuration` annotation, which can hold a full copy of a Secret. `valueFrom` references are kept. Output is capped at 64 KiB. Listing without `name` uses the metadata API, so object bodies never leave the API server.
+- **`k8s_list_helm_releases`** reads only the labels on Helm's release Secrets through the metadata API. Chart contents and values are never fetched. Releases stored in ConfigMaps (Helm's `configmap` driver) aren't listed.
+- A workload kind or the EndpointSlices that the identity can't list are reported in `errors` / `warnings` instead of failing the call.
+
 Config is loaded on the first k8s call: the in-cluster service account first (one context, `in-cluster`), then `$KUBECONFIG`, then `~/.kube/config`. The default context is `K8S_CONTEXT`, else kubeconfig's `current-context`. Only contexts in `K8S_ALLOWED_CONTEXTS` can be used; when it's unset, that's just the default context. Each context gets its own client, created when first used and then reused. Kubeconfig is read once, so restart the gateway after editing it. The server starts without a cluster; calls just return an error.
 
 ## Safety model
@@ -242,7 +274,8 @@ The target layout, namespace `infra-agent`:
 - **Agent:** a separate workload (Claude Agent SDK) that calls `http://<service>.infra-agent.svc:8080/mcp` with the token from a Secret.
 - **Runner:** a CronJob running `-mode=runner`.
 - **Pod security:** `runAsNonRoot`, `readOnlyRootFilesystem` with an `emptyDir` at `/tmp`, `capabilities: drop: [ALL]` (nmap connect scans need no raw sockets), seccomp `RuntimeDefault`.
-- **RBAC for the k8s tools:** a dedicated ServiceAccount bound to a ClusterRole with only `get`/`list` on `pods` and `namespaces` (see below). Listing namespaces is cluster-scoped, so `k8s_list_namespaces` needs the ClusterRole. If the agent should only see some namespaces, drop that tool from `ENABLED_TOOLS`, use a namespaced Role for `pods` and have the agent always pass `namespace` to `k8s_list_images`.
+- **RBAC for the k8s tools:** a dedicated ServiceAccount bound to a ClusterRole with only `get`/`list` on the kinds the tools read, plus a few common kinds for `k8s_get_resource` (see below; trim it to taste). The cluster decides what the gateway can see: `k8s_get_resource` can only read kinds you grant, so leave `secrets` out of it. Nodes, namespaces and CRDs are cluster-scoped, so their tools need the ClusterRole. If the agent should only see some namespaces, turn those tools off in `ENABLED_TOOLS`, use namespaced Roles, and have the agent always pass `namespace`.
+- **Helm releases (optional):** Helm stores releases in Secrets, and Kubernetes RBAC can't grant "labels only": `list` on `secrets` also allows reading their data. The gateway only asks the metadata API, but the ServiceAccount token itself could read the values. Grant it only where you need `k8s_list_helm_releases`, ideally per namespace, or turn the tool off.
 - **NetworkPolicy:** ingress only from the agent; egress only to `NMAP_ALLOWED_CIDRS`, the Kubernetes API server, your registries and your git host. This is the same scope the code enforces, applied a second time at the network level.
 
 ```yaml
@@ -251,13 +284,48 @@ kind: ClusterRole
 metadata: { name: infra-mcp-gateway-k8s-read }
 rules:
   - apiGroups: [""]
-    resources: ["pods", "namespaces"]
+    resources: ["pods", "namespaces", "nodes", "services", "configmaps", "serviceaccounts", "persistentvolumeclaims", "persistentvolumes", "events"]
     verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "ingressclasses", "networkpolicies"]
+    verbs: ["get", "list"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list"]
+  # Add the custom resources k8s_get_resource should read, e.g.:
+  # - apiGroups: ["cert-manager.io"]
+  #   resources: ["certificates", "issuers"]
+  #   verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata: { name: infra-mcp-gateway-k8s-read }
 roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: infra-mcp-gateway-k8s-read }
+subjects:
+  - { kind: ServiceAccount, name: infra-mcp-gateway, namespace: infra-agent }
+---
+# Optional, for k8s_list_helm_releases in one namespace (see the note above).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: infra-mcp-gateway-helm-releases, namespace: prod }
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: infra-mcp-gateway-helm-releases, namespace: prod }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: infra-mcp-gateway-helm-releases }
 subjects:
   - { kind: ServiceAccount, name: infra-mcp-gateway, namespace: infra-agent }
 ```
@@ -292,13 +360,18 @@ Actions are pinned to commit SHAs, and Dependabot keeps them and the Go modules 
 
 ```
 cmd/main.go                 mode switch, HTTP server, bearer auth, probes, runner loop
-internal/tools/             MCP tool definitions, input schemas, registry (one line per tool)
+internal/tools/             MCP tool definitions, input schemas, registry; k8s_inventory_tools.go shares one handler for the inventory tools
 internal/service/           validation, scope checks, scanner invocation, result shaping
   command.go                RunCommand: slots, output cap, process-group kill
   nmap.go                   ScanNmap, resolveTargets (CIDR scope), SummarizeNmap
   trivy.go                  ScanTrivy, allowed roots, refs, default scanners
   k8s.go                    ListK8sImages, ListK8sNameSpace, ParseImageRef
-  k8s_contexts.go           K8sSource: kubeconfig/in-cluster contexts, allowlist, per-context clients
+  k8s_contexts.go           K8sSource: kubeconfig/in-cluster contexts, allowlist, per-context typed/dynamic/metadata clients
+  k8s_nodes.go              ListK8sNodes: health, capacity, pod requests per node
+  k8s_workloads.go          ListK8sWorkloads: Deployment/StatefulSet/DaemonSet/CronJob/Job status
+  k8s_pods.go               ListK8sPods: kubectl-style status, restarts, last termination
+  k8s_network.go            ListK8sServices (with EndpointSlices), ListK8sIngresses
+  k8s_resource.go           GetK8sResource (discovery + dynamic, redaction), ListK8sCRDs, ListK8sHelmReleases
 internal/types/             input and output structs shared by every layer
 ```
 
