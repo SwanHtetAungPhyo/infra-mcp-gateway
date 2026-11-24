@@ -1,0 +1,10 @@
+.git
+.idea
+.env
+.env.*
+!.env.example
+bin
+J
+output.txt
+output.xml
+*.md
